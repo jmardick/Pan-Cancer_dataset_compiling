@@ -1,0 +1,275 @@
+---
+title: "DESI Compiling"
+subtitle: "Preliminary Hierarchical Clustering"
+author: "Jacob Mardick"
+date: "`r format(Sys.time(), '%B %d, %Y %H:%M')`"
+knit: (function(inputFile, encoding) { 
+      proj_name <- tools::file_path_sans_ext(basename(inputFile));
+      out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()));
+      if(!file.exists(out_dir)) {   dir.create(out_dir) };
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), 
+                        out_dir, 
+                        paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"),"_", proj_name, ".html"))) 
+                        })
+
+output: 
+  html_document:
+    keep_md: yes
+    df_print: paged
+    toc: false
+geometry: margin=0.5in
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+max-width: 1600px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+```
+
+```{css, echo=FALSE}
+h1, h2, h3, h4, h5 {
+font-size: 20px;
+}
+
+h1, h2, h3, h4, h5, p {
+text-align: center;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, cache = FALSE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(rmarkdown)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+
+library(tidyverse)
+library(reshape2)
+library(readxl)
+library(rawrr)
+library(sqldf)
+
+library(stringr)
+library(doParallel)
+library(fcluster)
+library(johnfuncs)
+
+library(caret) ## automates supervised learning (predictive modeling)
+library(glmnet) ## for training, cross validation, and testing model
+library(pROC) ## for plotting ROC curve
+library(scales) ## for integer y-axis on histogram
+```
+
+```{r user input}
+## Load all tissue data from individual preprocessing scripts
+# Define root folder where all preprocessing outputs are stored
+root_dir <- gsub("\\\\", "/", r"(C:\Users\Jacob\Documents\Thesis\Aim 1\0001 Dataset Compiling\Pan-Cancer_dataset_compiling\outputs)")
+
+# Find all "04_aligned_spectra.RData" and corresponding "00_*_Robjects_for_analysis.RData"
+aligned_paths <- list.files(root_dir, pattern = "^04_aligned_spectra\\.RData$", recursive = TRUE, full.names = TRUE)
+metadata_paths <- list.files(root_dir, pattern = "^00_.*_Robjects_for_analysis\\.RData$", recursive = TRUE, full.names = TRUE)
+
+# Initialize storage
+aligned_list <- list()
+yall_list <- list()
+pi_list <- list()
+
+get_tissue_name <- function(path) basename(dirname(dirname(path)))
+
+for (aligned_path in aligned_paths) {
+  tissue_name <- get_tissue_name(aligned_path)
+
+  match_path <- metadata_paths[grepl(tissue_name, metadata_paths)]
+
+  if (length(match_path) != 1) {
+    warning(paste("Could not uniquely match metadata for tissue:", tissue_name))
+    next
+  }
+
+  load(aligned_path)  # loads: aligned_spectra
+  aligned_list[[tissue_name]] <- aligned_spectra
+
+  load(match_path)  # loads: yall, pi, etc.
+  yall_list[[tissue_name]] <- yall
+  pi_list[[tissue_name]] <- pi
+}
+```
+
+```{r merge aligned spectra}
+# Get the union of all m/z values across all aligned spectra
+all_mz <- sort(unique(unlist(lapply(aligned_list, colnames))))
+
+aligned_list <- lapply(aligned_list, function(x) {
+  x <- as.matrix(x)
+  colnames(x) <- make.unique(colnames(x))  # handle any duplicate m/z
+  return(x)
+})
+
+# Merge matrices into a single common matrix
+xall <- do.call(rbind, lapply(aligned_list, function(mat) {
+  mat <- as.matrix(mat)
+  mat_aligned <- matrix(0, nrow = nrow(mat), ncol = length(all_mz),
+                        dimnames = list(rownames(mat), all_mz))
+  
+  common_mz <- intersect(colnames(mat), all_mz)
+  
+  # Match column indices properly
+  mat_aligned[, common_mz] <- mat[, common_mz, drop = FALSE]
+  
+  return(mat_aligned)
+}))
+```
+
+```{r pi combined}
+for (name in names(pi_list)) {
+  pi_list[[name]]$tissue <- name  # tag source tissue
+}
+
+pi_combined <- do.call(rbind, pi_list)
+pi_combined <- pi_combined %>%
+  mutate(
+    sample = sapply(strsplit(pixel_name, "\\."), `[`, 1),
+    class_binary = case_when(
+      className %in% c("Normal", "1NL", "ExtractedDESI_NLB") ~ "Normal",
+      TRUE ~ "Cancer"
+    )
+  )
+sample_class_df <- pi_combined %>%
+  distinct(sample, sample_class = class_binary, tissue)
+```
+
+```{r normalization}
+xall_norm <- normalize_pixel(xall, normalization_method)
+library(dplyr)
+
+x_df <- as.data.frame(as.matrix(xall_norm))
+x_df$sample <- sapply(strsplit(rownames(x_df), "\\."), `[`, 1)
+
+sample_avg <- x_df %>%
+  group_by(sample) %>%
+  summarise(across(where(is.numeric), mean))
+
+x_sample <- as.matrix(sample_avg[, -1])
+rownames(x_sample) <- sample_avg$sample
+
+# PCA on samples
+x_pca <- prcomp(x_sample, center = TRUE, scale. = TRUE)
+hc <- hclust(dist(x_pca$x[, 1:10]), method = "ward.D2")
+plot(hc, main = "Clustering of Sample Averages via PCA")
+```
+
+```{r enhance plots}
+# Keep only samples with known class
+keep_samples <- intersect(labels(dend), sample_class_df$sample)
+
+# Prune dendrogram
+library(dendextend)
+dend_pruned <- prune(dend, setdiff(labels(dend), keep_samples))
+
+# Now use only matched samples
+sample_class_vec <- setNames(sample_class_df$sample_class, sample_class_df$sample)
+ordered_classes <- sample_class_vec[labels(dend_pruned)]
+
+# Assign colors
+palette <- colorRampPalette(brewer.pal(8, "Set2"))
+class_colors <- setNames(palette(length(unique(ordered_classes))), unique(ordered_classes))
+color_vector <- class_colors[ordered_classes]
+
+bar_colors <- matrix(color_vector, nrow = 1)
+rownames(bar_colors) <- "Class"
+
+# Plot
+colored_bars(colors = bar_colors, dend = dend_pruned, sort_by_labels_order = TRUE)
+plot(dend_pruned, main = "Dendrogram (Class-Labeled Samples Only)", cex = 0.8)
+legend("topright", legend = names(class_colors), fill = class_colors, border = NA, title = "Class")
+
+# Ensure we retain the binary labels
+sample_class_df <- pi_combined %>%
+  distinct(sample, sample_class = class_binary, tissue)
+
+
+library(dendextend)
+
+# Dendrogram (from earlier PCA → hclust step)
+dend <- as.dendrogram(hc)
+
+# Extract dendrogram labels (sample names in order)
+dend_labels <- labels(dend)
+
+# Build sample-to-class lookup
+sample_class_vec <- setNames(sample_class_df$sample_class, sample_class_df$sample)
+
+# Match class labels to dendrogram order
+ordered_classes <- sample_class_vec[dend_labels]
+
+# Pick a color for each class
+library(RColorBrewer)
+palette <- colorRampPalette(brewer.pal(8, "Set2"))
+class_colors <- setNames(palette(length(unique(ordered_classes))),
+                         unique(ordered_classes))
+
+# Map class names to color
+color_vector <- class_colors[ordered_classes]
+
+# Create a color matrix (1 row = 1 annotation track)
+bar_colors <- matrix(color_vector, nrow = 1)
+rownames(bar_colors) <- "Class"
+
+# Plot colored bars and dendrogram
+colored_bars(colors = bar_colors, dend = dend, sort_by_labels_order = TRUE)
+plot(dend, main = "Dendrogram with Class Annotations", cex = 0.8)
+legend("topright", legend = names(class_colors), fill = class_colors, border = NA, cex = 0.7)
+```
+
+```{r pca plot}
+# Get PCA scores (first few PCs)
+pca_df <- as.data.frame(x_pca$x[, 1:3])  # you can keep more if needed
+pca_df$sample <- rownames(pca_df)
+
+# Merge with class and tissue annotations
+pca_annotated <- left_join(pca_df, sample_class_df, by = "sample")
+
+library(ggplot2)
+
+ggplot(pca_annotated, aes(x = PC1, y = PC2, color = sample_class)) +
+  geom_point(size = 3) +
+  theme_minimal(base_size = 14) +
+  labs(title = "PCA of Sample Averages",
+       x = "PC1", y = "PC2", color = "Class") +
+  theme(legend.position = "right")
+```
+
+```{r save}
+ggsave("PCA_sample_plot.png", width = 8, height = 6, dpi = 300)
+pdf("dendrogram_with_class_bar.pdf", width = 10, height = 6)
+colored_bars(colors = bar_colors, dend = dend, sort_by_labels_order = TRUE)
+plot(dend, main = "Dendrogram with Class Annotations", cex = 0.8)
+legend("topright", legend = names(class_colors), fill = class_colors, border = NA, title = "Group")
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
