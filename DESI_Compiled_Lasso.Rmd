@@ -1,0 +1,1038 @@
+---
+title: "DESI Compiled Lasso"
+author: "Jacob Mardick"
+date: "`r format(Sys.time(), '%B %d, %Y %H:%M')`"
+knit: (function(inputFile, encoding) { 
+      proj_name <- tools::file_path_sans_ext(basename(inputFile));
+      out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()));
+      if(!file.exists(out_dir)) {   dir.create(out_dir) };
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), 
+                        out_dir, 
+                        paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"),"_", proj_name, ".html"))) 
+                        })
+
+output: 
+  html_document:
+    keep_md: yes
+    df_print: paged
+    toc: false
+geometry: margin=0.5in
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+max-width: 1600px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+```
+
+```{css, echo=FALSE}
+h1, h2, h3, h4, h5 {
+font-size: 20px;
+}
+
+h1, h2, h3, h4, h5, p {
+text-align: center;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, cache = FALSE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(rmarkdown)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+
+library(tidyverse)
+library(reshape2)
+library(readxl)
+library(rawrr)
+library(sqldf)
+
+library(stringr)
+library(doParallel)
+library(fcluster)
+library(johnfuncs)
+
+library(caret) ## automates supervised learning (predictive modeling)
+library(glmnet) ## for training, cross validation, and testing model
+library(pROC) ## for plotting ROC curve
+library(scales) ## for integer y-axis on histogram
+```
+
+```{r user input}
+## Mass range to filter
+mass_range <- c(100,1000)
+
+## Peak Alignment Method: "clustering" or "binning" (TBD on "featurelist")
+peak_alignment_method <- "clustering"
+
+## If peak alignment method is "clustering":
+## Height at which to cut dendrogram to determine clusters
+clust_h <- 0.05
+
+## Method to handle many intensities in one cluster centroid: 
+## sum the intensities of peaks in one cluster centroid ("sumints", default) 
+## or use the max intensity ("maxint")
+clust_int_method  <-  "sumints"
+
+## Normalization Method: "tic", "maxpeak", "median", "medianlog", or "none"
+normalization_method <- "tic" 
+
+## Full path to background peak list, otherwise NULL
+background_file <- NULL
+```
+
+```{r create directory for output files, include = FALSE}
+proj_name <- tools::file_path_sans_ext(basename(rstudioapi::getSourceEditorContext()$path))
+
+out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()))
+
+if(!file.exists(out_dir)) {   
+  dir.create(out_dir, recursive = TRUE) 
+  }
+
+files_dir <- file.path(out_dir, paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"), "_", proj_name, "_files"))
+
+if(!file.exists(files_dir)) {   
+  dir.create(files_dir, recursive = TRUE) 
+  }
+```
+
+```{r load data}
+load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_Hierarchical-Clustering_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/04_aligned_spectra.RData")
+load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_Hierarchical-Clustering_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/compiled_data_input.RData")
+```
+
+```{r equalize pixels}
+# Combine tissue type and class into a single label
+pi$class <- yall
+
+pi <- pi %>%
+  mutate(tissue_class = paste(tissue, class, sep = "_"))
+
+# Determine how many pixels per group (minimum count)
+pixels_per_group <- pi %>%
+  group_by(tissue_class) %>%
+  tally() %>%
+  pull(n) %>%
+  min()  ## or choose fixed like: pixels_per_group <- 100
+
+set.seed(123)  # Reproducibility
+
+# Sample equal number of pixels per tissue_class combination
+equal_pixel_idx <- pi %>%
+  mutate(row_id = row_number()) %>%
+  group_by(tissue_class) %>%
+  slice_sample(n = pixels_per_group) %>%
+  ungroup() %>%
+  pull(row_id)
+
+# Subset the data
+xall <- xall[equal_pixel_idx, ]
+yall <- yall[equal_pixel_idx]
+pi <- pi[equal_pixel_idx, ]
+pi$class <- yall
+```
+
+```{r Split Data into Training and Testing Sets}
+## Identify unique sample IDs
+unique_samples <- unique(pi$name)
+
+## Split patients or samples, not pixels
+set.seed(123)
+train_samples <- sample(unique_samples, size = floor(0.7 * length(unique_samples)))
+
+## Train/test split
+train_idx <- which(pi$name %in% train_samples)
+test_idx  <- which(!pi$name %in% train_samples)
+
+sample_names <- pi$name
+
+xtrain <- xall[train_idx, ]
+ytrain <- yall[train_idx]
+xtest  <- xall[test_idx, ]
+ytest  <- yall[test_idx]
+```
+
+```{r Training}
+model <- glmnet(
+  xtrain, 
+  ytrain, 
+  family = "binomial", ## for logit (logarithm of the odds) or logistic regression
+  alpha = 1, ## for lasso
+  standardize = FALSE, ## because intensities are already in same units
+  lambda.min.ratio = 1e-05 ) ## The model will compute its own lambda sequence based on nlambda and lambda.min.ratio 
+```
+
+```{r Cross Validation}
+## set number of folds
+#nfolds <- length(unique(patient_ids))
+#nfolds <- nrow(xtrain) ## leave-one-sample-out cross validation
+## Create foldid for LOPOCV
+train_sample_ids <- pi$name[train_idx]  # Get sample names for each training pixel
+unique_samples_train <- unique(train_sample_ids)
+sample_to_fold <- setNames(seq_along(unique_samples_train), unique_samples_train)
+foldid <- sample_to_fold[train_sample_ids]  # Map each pixel to its sample’s fold ID
+
+seed <- 1234
+set.seed(seed)
+## cross validation
+cvmodel <- cv.glmnet(
+  xtrain, 
+  ytrain, 
+  foldid = foldid,
+  type.measure = "class", ## loss to use for binomial cross-validation, gives misclassification error
+  keep = TRUE, ## returns a prevalidated array containing fitted values 
+  ## for each observation and each value of lambda
+  family = "binomial", ## for logit (logarithm of the odds) or logistic regression
+  alpha = 1, ## for lasso
+  standardize = FALSE, ## because intensities are already in same units
+  lambda.min.ratio = 1e-05 )
+```
+
+```{r ROC Metrics}
+## save index of lambda value that gives minimum cvm (mean cross-validated error)
+min_lambda_index <- which(cvmodel$lambda == cvmodel$lambda.min)
+
+## 1/(1+e^(-preval)) is the inverse of the link function?
+cv_predictions <- 1/(1+exp(-cvmodel$fit.preval[,min_lambda_index]))
+
+## build ROC for training data using minLamIdx
+roc_curve <- roc(
+  ytrain, 
+  cv_predictions )
+
+## create dataframe from ROC object to create plot for trade off
+## of accuracy, sensitivity, and specificity
+roc_df <- data.frame(
+  cutoff = roc_curve$thresholds, 
+  sensitivity = roc_curve$sensitivities, 
+  specificity = roc_curve$specificities )
+
+roc_df$accuracy <- (roc_df$sensitivity*length(roc_curve$cases) + 
+                      roc_df$specificity*length(roc_curve$controls)) / (length(roc_curve$cases) + 
+                                                                          length(roc_curve$controls) )
+
+## plot trade off of accuracy, sensitivity, and specificity
+roc_metrics <- ggplot(roc_df) + geom_line(aes(cutoff, sensitivity, col = "Sensitivity")) + 
+  geom_line(aes(cutoff, specificity, col = "Specificity")) + 
+  geom_line(aes(cutoff, accuracy, col = "Accuracy")) +
+  labs(x = "cutoff", y = "%", color="") +
+  ggtitle("Trade off of performance metrics for determining threshold cutoff value")
+```
+
+```{r Threshold Coordinates}
+## Identify Threshold Coordinates where Accuracy, Sensitivity, and Specificity Cross
+## Set threshold for labeling classes --> balance of true positive and false positive rates.
+best_threshold <- as.double(coords(roc_curve, 
+                                   "best", ## coordinates for best threshold value
+                                   ret = "threshold", ## coordinates to return
+                                   best.method = "youden" )[1,1]) ## optimal cut-off is the threshold that maximizes the distance to the identity (diagonal) line
+```
+
+```{r CV Confusion Matrix}
+## predict classes based on threshold
+cv_p_thresh <- ifelse(cv_predictions < best_threshold, levels(ytrain)[1], levels(ytrain)[2])
+
+cv_p_class <- factor(cv_p_thresh, levels(ytrain))
+
+## simple confusion matrix table
+cv_cm <- table(True=ytrain,
+               Predict=cv_p_class)
+```
+
+```{r Training Histogram}
+## Get predictions from cv.glmnet
+fit_vals <- cvmodel$fit.preval[, min_lambda_index]
+
+## Only keep those rows with non-NA predictions
+valid_idx <- !is.na(fit_vals)
+
+## Convert to probabilities
+cv_predictions <- 1 / (1 + exp(-fit_vals[valid_idx]))
+
+## Predicted classes
+cv_p_class <- ifelse(cv_predictions < best_threshold, "Normal", "Cancer")
+
+## True labels (same filtering)
+ytrain_valid <- ytrain[valid_idx]
+sample_names_valid <- sample_names[train_idx][valid_idx]
+
+## Create dataframe
+train_df <- data.frame(
+  file_name = sample_names_valid,
+  true_class = ytrain_valid,
+  prediction_class = cv_p_class,
+  probability = cv_predictions
+)
+```
+
+```{r Report Model Coefficients}
+classes <- levels(yall)
+coef <- reportCoef(xall, model, cvmodel$lambda.min, filtered_mz, classes)
+```
+
+```{r Testing}
+test_p <- predict(model,
+                  xtest,
+                  s = cvmodel$lambda.min, ## Value of the penalty parameter lambda 
+                  ## at which predictions are required
+                  type = "response" ) ## to get prediction values rather than linker function values
+```
+
+```{r Testing Confusion Matrix}
+test_p_thresh <- ifelse(test_p < best_threshold, classes[1], classes[2]) 
+test_p_class <- factor(test_p_thresh, levels(ytest))
+
+## simple confusion matrix table
+test_cm <- table(True=ytest,
+                 Predict=test_p_class)
+```
+
+```{r Test Histogram}
+test_df <- data.frame(
+  file_name = pi$name[test_idx],
+  true_class = ytest,
+  prediction_class = test_p_class,
+  probability = as.numeric(test_p)
+)
+
+rownames(test_df) <- NULL
+
+train_wrong_preds <- train_df %>%
+  filter(true_class != prediction_class)
+
+test_wrong_preds <- test_df %>%
+  filter(true_class != prediction_class)
+```
+
+```{r save files, include = FALSE}
+## training set files
+
+write.csv(cv_cm, 
+          file = file.path(files_dir, "train_cm.csv"))
+
+write.csv(train_df, 
+          row.names = FALSE,
+          file.path(files_dir, "train_preds.csv"))
+
+write.csv(train_wrong_preds, 
+          row.names = FALSE,
+          file.path(files_dir, "misclassified_train_preds.csv"))
+
+write.csv(coef, 
+          file.path(files_dir, "coefficients.csv"))
+
+## test set files
+
+write.csv(test_cm, 
+          file = file.path(files_dir, "test_cm.csv"))
+
+write.csv(test_df, 
+          row.names = FALSE,
+          file.path(files_dir, "test_preds.csv"))
+
+write.csv(test_wrong_preds, 
+          row.names = FALSE,
+          file.path(files_dir, "misclassified_test_preds.csv"))
+```
+
+```{r save plots, include=FALSE}
+png(filename = file.path(files_dir, "cv_plot.png"), width = 1000, height = 800, res = 150)
+plot(cvmodel)
+title("Cross-Validation Curve: Binomial Family", line = 3, cex.main = 1.6)
+dev.off()
+
+png(filename=file.path(files_dir, "roc_plot.png"))
+plot(roc_curve, 
+     print.thres="best", 
+     print.thres.best.method="youden",
+     print.auc=TRUE, 
+     auc.polygon=TRUE,
+     main = "ROC Curve")
+dev.off()
+
+ggsave(roc_metrics, filename = file.path(files_dir, "roc_metrics_thresh.png"))
+```
+
+<br>
+
+#### **Preprocessing and Statistical Model Settings**
+
+```{r chunk3, fig.align = "center"}
+if (peak_alignment_method == "clustering") {
+  cluster_bin_size <- c("Cluster Height:", clust_h)
+} else if (peak_alignment_method == "binning") {
+  cluster_bin_size <- c("Bin Size:", "0.01")
+} else if (peak_alignment_method == "featurelist") {
+  cluster_bin_size <- c("Peak Mass Error:", paste0(ppm_error, " ppm"))
+}
+
+if (is.null(background_file)) {
+  bg_exclusion <- "no"
+} else if (!is.na(background_file)) {
+  bg_exclusion <- "yes"
+}
+train_fraction <- 0.7
+settings_df <- rbind(#c("SNR Threshold:", SNR_thresh),
+                     c("Mass Range:", paste0('<i>m/z</i> ', mass_range[1], " - ", mass_range[2])),
+                     c("Peak Alignment Method:", peak_alignment_method),
+                     cluster_bin_size,
+                     c("Background Peak Exclusion:", bg_exclusion),
+                     c("Normalization Method:", normalization_method),
+                     c("Randomization Seed:", seed),
+                     c("Train/Test Split:", paste0((train_fraction*100),"/",(100-(train_fraction*100)))),
+                     c("Elastic Net Alpha:", "1 (LASSO)"))
+
+classes2 <- tools::toTitleCase(gsub("_", " ", classes))
+#classes2 <- unlist(lapply(str_split(classes, pattern  = " "), tail, n = 1L)) ## If class is last element of full class name
+#classes2 <- unlist(lapply(str_split(classes, pattern  = "_"), tail, n = 1L)) ## If class is last element of full class name
+
+kable(settings_df,
+      row.names = FALSE,
+      align = "l",
+      format = "html",
+      escape = FALSE)%>%
+  column_spec(1:2, width = "3in")%>% 
+  kable_styling(full_width = F)
+
+#cols <- rev(c(hue_pal()(2))) ## teal, salmon
+cols <- c(hue_pal()(2)) ## salmon, teal
+```
+
+```{r chunk4}
+cv_cm <- as.data.frame.matrix(cv_cm)
+test_cm <- as.data.frame.matrix(test_cm)
+
+cv_cm <- cbind(c("True", "True"),
+               classes2,
+               cv_cm)
+
+test_cm <- cbind(c("True", "True"),
+                 classes2,
+                 test_cm)
+
+rownames(cv_cm) <- NULL
+rownames(test_cm) <- NULL
+
+colnames(cv_cm) <- c(".", "  ", classes2)
+colnames(test_cm) <- c(".", "  ", classes2)
+
+names(cv_cm)[1] <- cell_spec(names(cv_cm)[1], color = "white")
+names(test_cm)[1] <- cell_spec(names(test_cm)[1], color = "white")
+
+cv_accuracy <- rbind(c(paste0(classes2[1], " Recall: "), 
+                       paste0(format(round((cv_cm[1,3]/rowSums(cv_cm[,3:4])[1])*100, 1), nsmall = 1), "%")),
+                     c(paste0(classes2[2], " Recall: "), 
+                       paste0(format(round((cv_cm[2,4]/rowSums(cv_cm[,3:4])[2])*100,1), nsmall = 1), "%")),
+                     c("Overall Accuracy: ", 
+                       paste0(format(round(((cv_cm[1,3] + cv_cm[2,4])/sum(cv_cm[, 3:4]))*100, 1), nsmall = 1), "%")))
+
+test_accuracy <- rbind(c(paste0(classes2[1], " Recall: "), 
+                         paste0(format(round((test_cm[1,3]/rowSums(test_cm[,3:4])[1])*100, 1), nsmall = 1), "%")),
+                       c(paste0(classes2[2], " Recall: "), 
+                         paste0(format(round((test_cm[2,4]/rowSums(test_cm[,3:4])[2])*100,1), nsmall = 1), "%")),
+                       c("Overall Accuracy: ", 
+                         paste0(format(round(((test_cm[1,3] + test_cm[2,4])/sum(test_cm[, 3:4]))*100, 1), nsmall = 1), "%")))
+```
+
+```{r chunk5}
+if(normalization_method == "median"){
+  coef2 <- data.frame(cbind(c("Intercept", format(as.numeric(rownames(coef[2:nrow(coef),])), nsmall = 3)), as.numeric(coef[, 1])))
+}else {
+  coef2 <- data.frame(cbind(c("Intercept", format(as.numeric(rownames(coef[2:nrow(coef),])), nsmall = 3)), format(round(as.numeric(coef[, 1]),3), nsmall = 3)))
+}
+
+colnames(coef2) <- c("Features", paste0("Weights (", classes2[2], ")"))
+```
+
+<br>
+
+#### **Training Set Confusion Matrix**
+
+```{r chunk6, fig.align = "center"}
+kable(cv_cm,
+      align = "c",
+      format = "html",
+      escape = FALSE) %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c("", " ", "Predict" = 2)) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE) %>%
+  collapse_rows(columns = 1) %>% 
+  column_spec(3, background = "#c3fcb5")
+
+kable(cv_accuracy,
+      row.names = FALSE,
+      align = "r") %>% 
+  column_spec(1, bold = TRUE) %>%
+  kable_minimal(full_width = FALSE,
+                bootstrap_options = "condensed",
+                html_font = "Calibri",
+                font_size = 16)
+```
+
+<br>
+
+#### **Test Set Confusion Matrix**
+
+```{r chunk7, fig.align = "center"}
+kable(test_cm,
+      align = "c",
+      format = "html",
+      escape = FALSE) %>%
+  kable_styling(full_width = FALSE) %>%
+  add_header_above(c("", "","Predict" = 2)) %>%
+  column_spec(1, bold = TRUE) %>%
+  column_spec(2, bold = TRUE) %>%
+  collapse_rows(columns = 1) %>%
+  column_spec(3, background = "#c3fcb5")
+
+kable(test_accuracy,
+      row.names = FALSE,
+      align = "r") %>% 
+  column_spec(1, bold = TRUE) %>%
+  kable_minimal(full_width = FALSE,
+                bootstrap_options = "condensed",
+                html_font = "Calibri",
+                font_size = 16)
+```
+
+<br>
+
+```{r roc curve report, fig.align='center', fig.width=4, fig.height=4}
+plot(roc_curve, 
+     print.thres="best", 
+     print.thres.best.method="youden",
+     print.auc=TRUE, 
+     auc.polygon=TRUE,
+     main = "ROC")
+```
+
+<br>
+
+#### **Model Predictive Feature Weights**
+
+```{r, fig.align = "center", include=FALSE}
+coef2 %>%
+  kable(
+    row.names = FALSE,
+    align = "c") %>% 
+  kable_styling(full_width = FALSE, 
+                font_size = 14) %>%
+  column_spec(1:2,width = "2in")
+```
+
+```{r}
+## remove intercept row
+#intercept <- paste0("Intercept:", coef2[1, 2])
+intercept <- coef2[1, 2]
+
+## split features into positive and negative
+pos_features <- coef2[which(as.numeric(coef2[[2]]) > 0), ]
+neg_features <- coef2[which(as.numeric(coef2[[2]]) < 0), ]
+
+pos_features <- subset(pos_features, Features != "Intercept")
+neg_features <- subset(neg_features, Features != "Intercept")
+
+max_len <- max(nrow(pos_features), nrow(neg_features))
+
+pos_features <- pos_features[c(NA, seq_len(nrow(pos_features)), rep(NA, max_len - nrow(pos_features))), ]
+neg_features <- neg_features[c(NA, seq_len(nrow(neg_features)), rep(NA, max_len - nrow(neg_features))), ]
+empty_col <- c(intercept, rep(NA, max_len))
+
+split_coefs <- cbind(pos_features, empty_col, neg_features)
+
+split_coefs[is.na(split_coefs)] <- ""
+
+colnames(split_coefs) <- c(paste0(classes2[2], " Features"), 
+                           paste0(classes2[2], " Weights"), 
+                           "Intercept", 
+                           paste0(classes2[1], " Features"),
+                           paste0(classes2[1], " Weights"))
+```
+
+```{r, fig.align = "center"}
+split_coefs %>%
+  kable(
+    row.names = FALSE,
+    align = "c",
+    linesep = ""
+  ) %>% 
+  kable_styling(full_width = F) %>%
+  column_spec(1:2,width = "1.5in") %>%
+  column_spec(3,width = "1in") %>%
+  column_spec(4:5,width = "1.5in")
+```
+
+```{r chunk8, fig.width=12, fig.height=4, fig.align = "center"}
+## head to tail bar plot of features and weights
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# Adjust min_y and max_y for space
+if (normalization_method == "median") {
+  max_y <- max(abs(as.numeric(coef2[2:nrow(coef2), 2])))
+  min_y <- -1 * max_y
+} else {
+  max_y <- round(max(abs(as.numeric(coef2[2:nrow(coef2), 2]))))
+  min_y <- -1 * max_y
+}
+max_y <- max_y + 100
+min_y <- min_y - 100
+
+# Prepare data
+coef3 <- coef2 %>%
+  mutate(fill = ifelse(as.numeric(coef2[, 2]) < 0, classes2[1], classes2[2])) %>%
+  mutate(fill = factor(fill, levels = classes2)) %>%
+  slice(-1)
+
+# Define manual label features
+manual_features <- c(885.548, 215.029)
+label_mz <- c(700.527, 574.497, 760.513, 514.284, 885.548, 215.029, 146.045)
+
+# Ensure numeric
+coef3$Features <- as.numeric(coef3$Features)
+coef3$`Weights (Cancer)` <- as.numeric(coef3$`Weights (Cancer)`)
+
+# Subset for labeling
+coef3_labeled <- coef3 %>%
+  filter(round(Features, 3) %in% round(label_mz, 3))
+
+# Auto labels
+auto_labels <- coef3_labeled %>%
+  filter(!(round(Features, 3) %in% round(manual_features, 3))) %>%
+  mutate(
+    vjust = ifelse(`Weights (Cancer)` > 0, -0.5, 1.5)
+  )
+
+manual_labels <- coef3_labeled %>%
+  filter(round(Features, 3) %in% round(manual_features, 3)) %>%
+  mutate(
+    line_y_start = `Weights (Cancer)`,
+
+    # Define raw label positions (where you'd ideally like it to go)
+    label_x_raw = case_when(
+      round(Features, 3) == 885.548 ~ Features + 15,
+      round(Features, 3) == 215.029 ~ Features - 40,
+      TRUE ~ Features
+    ),
+    label_y_raw = case_when(
+      round(Features, 3) == 885.548 ~ `Weights (Cancer)` + 300,
+      round(Features, 3) == 215.029 ~ `Weights (Cancer)` - 200,
+      TRUE ~ `Weights (Cancer)`
+    )
+  ) %>%
+  mutate(
+    # Compute midpoint of the leader line
+    label_x = (Features + label_x_raw) / 2,
+    label_y = (line_y_start + label_y_raw) / 2,
+
+    # Offset perpendicular to leader line
+    dx = label_x - Features,
+    dy = label_y - line_y_start,
+    norm = sqrt(dx^2 + dy^2),
+    label_x = label_x + 6 * (-dy / norm),
+    label_y = label_y + 6 * (dx / norm),
+
+    # Final manual staggering
+    label_y = case_when(
+      round(Features, 3) == 215.029 ~ label_y - 25,
+      round(Features, 3) == 885.548 ~ label_y + 25,
+      TRUE ~ label_y
+    )
+  )
+
+# Plot
+coef_plot <- ggplot(coef3, aes(x = Features, y = `Weights (Cancer)`, fill = fill)) +
+  geom_bar(stat = "identity", width = 2) +
+  labs(y = "Weights", x = expression(italic("m/z"))) +
+  coord_cartesian(xlim = mass_range, ylim = c(min_y - 100, max_y + 100)) +
+  scale_x_continuous(breaks = seq(mass_range[1], mass_range[2], by = 50), expand = c(0.01, 0)) +
+  scale_y_continuous(expand = c(0.01, 0)) +
+  scale_fill_manual(values = cols) +
+  ggtitle("Model Feature Weights") +
+  theme_classic() +
+  guides(fill = guide_legend(byrow = TRUE)) +
+  theme(
+    legend.title = element_blank(),
+    legend.background = element_rect(fill = 'transparent')
+  ) +
+  geom_hline(yintercept = 0) +
+
+  # Auto labels
+  geom_text(
+    data = auto_labels,
+    aes(x = Features, y = `Weights (Cancer)`, label = round(Features, 3), vjust = vjust),
+    size = 3
+  ) +
+
+  # Manual labels
+  geom_text(
+    data = manual_labels,
+    aes(x = label_x, y = label_y, label = round(Features, 3)),
+    size = 3,
+    hjust = 0.5,
+    vjust = 0.5
+  ) +
+  geom_segment(
+    data = manual_labels,
+    aes(x = Features, y = line_y_start, xend = label_x, yend = label_y),
+    color = "gray30",
+    linewidth = 0.3
+  )
+
+# Display
+coef_plot
+```
+
+```{r chunk9, fig.width=8, fig.height=3, fig.align = "center"}
+train_plot <- ggplot(train_df, aes(x=probability, fill=true_class, color=true_class)) + 
+  geom_histogram(binwidth=0.01, alpha=0.25, position="identity",boundary=0) + 
+  ggtitle("Model Prediction Probabilities: Training Set") +
+  geom_vline(xintercept = best_threshold, linewidth = 0.75,  color = "black", linetype = "dashed") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), minor_breaks = seq(0, 1, by = 0.05), expand = c(0.05,0)) +
+  scale_color_manual(values = cols, labels = c(classes2[1], classes2[2])) +
+  scale_fill_manual(values = cols, labels = c(classes2[1], classes2[2])) +
+  labs(x = "Prediction Probability", y = "Spectra Count", color="True Class", fill = "True Class") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.title = element_text(hjust = 0.5, size = 16))
+
+test_plot <- ggplot(test_df, aes(x=probability, fill=true_class, color=true_class)) + 
+  geom_histogram(binwidth=0.01, alpha=0.25, position="identity",boundary=0) + 
+  ggtitle("Model Prediction Probabilities: Test Set") +
+  geom_vline(xintercept = best_threshold, linewidth = 0.75,  color = "black", linetype = "dashed") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), minor_breaks = seq(0, 1, by = 0.05), expand = c(0.05,0)) +
+  scale_color_manual(values = cols, labels = c(classes2[1], classes2[2])) +
+  scale_fill_manual(values = cols, labels = c(classes2[1], classes2[2])) +
+  labs(x = "Prediction Probability", y = "Spectra Count", color="True Class", fill = "True Class") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+ggsave(plot=coef_plot, filename = file.path(files_dir, "coef_plot.png"), 
+       width = 12,
+       height = 3,
+       units = "in",
+       dpi = 300)
+
+ggsave(plot=train_plot, width = 1000 / 150, height = 800 / 150, dpi = 150, filename = file.path(files_dir, "train_histogram.png"), bg = "white")
+ggsave(plot=test_plot, filename = file.path(files_dir, "test_histogram.png"), bg = "white")
+```
+
+```{r chunk10}
+## Add misclassified training samples
+train_wrong_preds <- train_df %>%
+  filter(true_class != prediction_class)
+
+train_wrong_preds <- train_wrong_preds[order(train_wrong_preds$true_class), ]
+
+train_wrong_preds$true_class <- gsub(classes[1], classes2[1], gsub(classes[2], classes2[2],train_wrong_preds$true_class))
+train_wrong_preds$prediction_class <- gsub(classes[1], classes2[1], gsub(classes[2], classes2[2],train_wrong_preds$prediction_class))
+
+train_wrong_preds$probability <- round(train_wrong_preds$probability, 3)
+
+## Add misclassified test samples
+test_wrong_preds <- test_df %>%
+  filter(true_class != prediction_class)
+
+test_wrong_preds <- test_wrong_preds[order(test_wrong_preds$true_class), ]
+
+test_wrong_preds$true_class <- gsub(classes[1], classes2[1], gsub(classes[2], classes2[2],test_wrong_preds$true_class))
+test_wrong_preds$prediction_class <- gsub(classes[1], classes2[1], gsub(classes[2], classes2[2],test_wrong_preds$prediction_class))
+
+test_wrong_preds$probability <- round(test_wrong_preds$probability, 3)
+```
+
+<br>
+
+#### **Training Set Misclassifications**
+
+```{r chunk11, fig.align = "center"}
+train_plot
+
+kable(train_wrong_preds,
+      #caption = "Training Set Misclassifications",
+      col.names = c("Sample Name", "True Class", "Predicted Class", "Probability"),
+      row.names = FALSE,
+      align = "l")  %>%
+  kable_styling(position = "center", 
+                bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, 
+                font_size = 14)
+```
+
+<br>
+
+#### **Test Set Misclassifications**
+
+```{r chunk12, fig.align = "center"}
+test_plot
+
+kable(test_wrong_preds,
+      #caption = "Test Set Misclassifications",
+      col.names = c("Sample Name", "True Class", "Predicted Class", "Probability"),
+      row.names = FALSE,
+      align = "l")  %>%
+  kable_styling(position = "center", 
+                bootstrap_options = c("striped", "condensed"),
+                full_width = FALSE, 
+                font_size = 14)
+```
+
+```{r other plots}
+library(dplyr)
+library(ggplot2)
+pi$class <- yall
+## Count of pixels by tissue and class
+pixel_counts <- pi %>%
+  group_by(tissue, class) %>%
+  summarize(n_pixels = n(), .groups = "drop")
+
+plot1 <- ggplot(pixel_counts, aes(x = tissue, y = n_pixels, fill = class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Tissue Type", y = "Pixel Count", fill = "Class") +
+  scale_y_continuous(breaks = seq(0, 2000, by = 100), limits = c(0, 2000)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.position = "right"
+    )
+
+ggsave(plot1, 
+       width = 9,        # wider than default
+       height = 6,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("pixelcounts_stratified.png")))
+
+sample_counts <- pi %>%
+  distinct(name, tissue, class) %>%
+  group_by(tissue, class) %>%
+  summarize(n_samples = n(), .groups = "drop")
+
+plot2 <- ggplot(sample_counts, aes(x = tissue, y = n_samples, fill = class)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(x = "Tissue Type", y = "Sample Count", fill = "Class") +
+  scale_y_continuous(breaks = seq(0, max(pixel_counts$n_pixels), by = 5)) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 14, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14)
+    )
+ggsave(plot2, 
+       width = 9,        # wider than default
+       height = 6,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("samplecounts_stratified.png"))
+       )
+```
+
+```{r pca}
+# Run PCA
+pca <- prcomp(xall, center = TRUE, scale. = TRUE)
+
+# Calculate variance explained
+var_explained <- (pca$sdev)^2 / sum(pca$sdev^2)
+pc_labels <- paste0("PC", 1:2, " (", round(var_explained[1:2] * 100, 1), "%)")
+
+# Create PCA data frame
+pca_df <- data.frame(PC1 = pca$x[, 1],
+                     PC2 = pca$x[, 2],
+                     tissue = pi$tissue,
+                     class = yall)
+
+# Plot
+plot3 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = tissue)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  labs(title = "PCA of All Pixels by Tissue Type",
+       x = pc_labels[1],
+       y = pc_labels[2],
+       color = "Tissue") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.title = element_text(size = 22, hjust = 0.5),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14)
+        ) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+ggsave(plot3, 
+       width = 8,        # wider than default
+       height = 8,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("pca_tissue.png"))
+       )
+
+plot4 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = class)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  labs(
+    title = "PCA of All Pixels by Class", 
+    x = paste0("PC1 (", round(summary(pca)$importance[2, 1] * 100, 1), "%)"),
+    y = paste0("PC2 (", round(summary(pca)$importance[2, 2] * 100, 1), "%)"),
+    color = "Class"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "right",
+        plot.title = element_text(size = 22, hjust = 0.5),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        legend.title = element_text(size = 16),
+        legend.text = element_text(size = 14)
+        ) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+ggsave(plot4, 
+       width = 8,        # wider than default
+       height = 8,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("pca_class.png"))
+       )
+
+# Variance explained
+var_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+# Create a data frame for plotting
+elbow_df <- data.frame(
+  PC = paste0("PC", 1:length(var_explained)),
+  Variance = var_explained
+)
+
+# Plot
+plot5 <- ggplot(elbow_df[1:100, ], aes(x = seq_along(Variance), y = Variance)) +
+  geom_line() +
+  geom_point() +
+  # scale_x_continuous(breaks = 1:20) +
+  labs(title = "PCA Scree Plot",
+       x = "Principal Component",
+       y = "Proportion of Variance Explained") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 22, hjust = 0.5),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 14)
+        )
+
+ggsave(plot5, 
+       width = 4.67,        # wider than default
+       height = 7,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("scree-plot.png"))
+       )
+```
+
+```{r tsne}
+library(Rtsne)
+
+# Use top 20 PCs (adjust based on the elbow)
+pca_input <- pca$x[, 1:20]
+dupe_idx <- !duplicated(pca_input)  # TRUE for rows kept
+# Remove duplicate rows
+pca_input_unique <- pca_input[dupe_idx, ]
+
+# Store mapping to original rows if you need to join later
+pca_input_idx <- match(data.frame(t(pca_input_unique)) |> as.list(), 
+                       data.frame(t(pca_input)) |> as.list())
+
+# Run t-SNE on unique inputs
+set.seed(42)
+tsne_result <- Rtsne(pca_input_unique, dims = 2, perplexity = 30, max_iter = 1000, verbose = TRUE)
+
+# Now map the t-SNE result back
+tsne_coords <- matrix(NA, nrow = nrow(pca_input), ncol = 2)
+tsne_coords[dupe_idx, ] <- tsne_result$Y  # fill only the non-duplicated rows
+
+# Make data.frame for plotting
+tsne_df <- data.frame(
+  X = tsne_coords[, 1],
+  Y = tsne_coords[, 2],
+  tissue = pi$tissue,
+  class = yall,
+  sample = pi$name
+)
+
+tsne_df_clean <- tsne_df[complete.cases(tsne_df[, c("X", "Y")]), ]
+
+plot6 <- ggplot(tsne_df_clean, aes(x = X, y = Y, color = class)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  theme_minimal() +
+  labs(title = "t-SNE of Top 20 PCs", color = "Class") +
+  guides(
+    color = guide_legend(override.aes = list(size = 3)),   # increase color dot size
+  ) +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 18)
+  )
+
+ggsave(plot6, 
+       width = 4.67,        # wider than default
+       height = 7,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("tsne_class.png"))
+       )
+
+plot7 <- ggplot(tsne_df_clean, aes(x = X, y = Y, color = tissue)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  theme_minimal() +
+  labs(title = "t-SNE of Top 20 PCs", color = "Tissue") +
+  guides(
+    color = guide_legend(override.aes = list(size = 3)),   # increase color dot size
+  ) +
+  theme(
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.position = "right",
+    plot.title = element_text(hjust = 0.5, size = 18)
+  )
+
+ggsave(plot7, 
+       width = 4.67,        # wider than default
+       height = 7,        # adjust as needed for aspect ratio
+       units = "in",      # specify inches
+       dpi = 300,  
+       file = file.path(files_dir, paste0("tsne_tissue.png"))
+       )
+```

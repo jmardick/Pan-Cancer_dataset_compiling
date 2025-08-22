@@ -71,7 +71,7 @@ background_file <- NULL
 ## ---------------------------------------------------------------------------
 
 ## Mass range to filter
-mass_range <- c(100,1000)
+mass_range <- c(500,1500)
 
 ## Peak Alignment Method: "clustering" or "binning" (TBD on "featurelist")
 peak_alignment_method <- "clustering"
@@ -112,7 +112,6 @@ if(!file.exists(files_dir)) {
 ```{r classes}
 ## read sub-directories for class names
 classes <- gsub(file.path(lung_sample_dir, "/"), "", list.dirs(lung_sample_dir, recursive=FALSE), fixed=TRUE)
-## Remove FNA class for now
 classes <- classes[!classes %in% c("FNA Extracted Files", "FNA Image Predictions")]
 ```
 
@@ -170,7 +169,7 @@ pi <- pixelInfoTibble(pixelInfoAll)
 # create a new column `x` with the three columns collapsed together
 pi$pixel_name <- paste0(pi$name, ".", pi$scanNum)
 
-save(pi, pixelInfoList, pixelInfoAll, file = file.path(files_dir, "01_pixel_information.RData"))
+save(pi, pixelInfoList, pixelInfoAll, sample_names, file = file.path(files_dir, "01_pixel_information.RData"))
 ```
 
 ### **Peak Alignment**
@@ -296,6 +295,10 @@ if (peak_alignment_method == "binning") {
 }
 ```
 
+```{r normalization}
+xall <- normalize_pixel(as.matrix(aligned_spectra), normalization_method)
+```
+
 ### **Create yall object**
 
 ```{r yall}
@@ -312,6 +315,7 @@ yall <- factor(yall, labels = classes)
 save(mass_range, peak_alignment_method, clust_h, normalization_method,
      classes, file_name_list, sample_names, pixelInfoList, pixelInfoAll, pi, filtered_mz, yall, 
      file = file.path(files_dir, paste0("00_", proj_name, "_Robjects_for_analysis.RData")))
+save(xall, yall, file = file.path(files_dir, paste0("00_", proj_name, "liver_features_for_Rob.RData")))
 ```
 
 ## **Session Info**

@@ -169,7 +169,7 @@ pi <- pixelInfoTibble(pixelInfoAll)
 # create a new column `x` with the three columns collapsed together
 pi$pixel_name <- paste0(pi$name, ".", pi$scanNum)
 
-save(pi, pixelInfoList, pixelInfoAll, file = file.path(files_dir, "01_pixel_information.RData"))
+save(pi, pixelInfoList, pixelInfoAll, sample_names, file = file.path(files_dir, "01_pixel_information.RData"))
 ```
 
 ### **Peak Alignment**

@@ -112,8 +112,6 @@ if(!file.exists(files_dir)) {
 ```{r classes}
 ## read sub-directories for class names
 classes <- gsub(file.path(ovarian_sample_dir, "/"), "", list.dirs(ovarian_sample_dir, recursive=FALSE), fixed=TRUE)
-## Remove FNA class for now
-classes <- classes[!classes %in% c("FNA Extracted Files", "FNA Image Predictions")]
 ```
 
 ```{r file and sample names}
