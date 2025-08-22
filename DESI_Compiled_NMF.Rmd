@@ -1,0 +1,231 @@
+---
+title: "DESI Compiled Lasso"
+author: "Jacob Mardick"
+date: "`r format(Sys.time(), '%B %d, %Y %H:%M')`"
+knit: (function(inputFile, encoding) { 
+      proj_name <- tools::file_path_sans_ext(basename(inputFile));
+      out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()));
+      if(!file.exists(out_dir)) {   dir.create(out_dir) };
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), 
+                        out_dir, 
+                        paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"),"_", proj_name, ".html"))) 
+                        })
+
+output: 
+  html_document:
+    keep_md: yes
+    df_print: paged
+    toc: false
+geometry: margin=0.5in
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+max-width: 1600px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+```
+
+```{css, echo=FALSE}
+h1, h2, h3, h4, h5 {
+font-size: 20px;
+}
+
+h1, h2, h3, h4, h5, p {
+text-align: center;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, cache = FALSE)
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(rmarkdown)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+
+library(tidyverse)
+library(reshape2)
+library(readxl)
+library(rawrr)
+library(sqldf)
+
+library(stringr)
+library(doParallel)
+library(fcluster)
+library(johnfuncs)
+
+library(caret) ## automates supervised learning (predictive modeling)
+library(glmnet) ## for training, cross validation, and testing model
+library(pROC) ## for plotting ROC curve
+library(scales) ## for integer y-axis on histogram
+```
+
+```{r user input}
+## Mass range to filter
+mass_range <- c(100,1000)
+
+## Peak Alignment Method: "clustering" or "binning" (TBD on "featurelist")
+peak_alignment_method <- "clustering"
+
+## If peak alignment method is "clustering":
+## Height at which to cut dendrogram to determine clusters
+clust_h <- 0.05
+
+## Method to handle many intensities in one cluster centroid: 
+## sum the intensities of peaks in one cluster centroid ("sumints", default) 
+## or use the max intensity ("maxint")
+clust_int_method  <-  "sumints"
+
+## Normalization Method: "tic", "maxpeak", "median", "medianlog", or "none"
+normalization_method <- "tic" 
+
+## Full path to background peak list, otherwise NULL
+background_file <- NULL
+```
+
+```{r create directory for output files, include = FALSE}
+proj_name <- tools::file_path_sans_ext(basename(rstudioapi::getSourceEditorContext()$path))
+
+out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()))
+
+if(!file.exists(out_dir)) {   
+  dir.create(out_dir, recursive = TRUE) 
+  }
+
+files_dir <- file.path(out_dir, paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"), "_", proj_name, "_files"))
+
+if(!file.exists(files_dir)) {   
+  dir.create(files_dir, recursive = TRUE) 
+  }
+```
+
+```{r load data}
+load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_Hierarchical-Clustering_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/04_aligned_spectra.RData")
+load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_Hierarchical-Clustering_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/compiled_data_input.RData")
+```
+
+```{r equalize pixels}
+# Combine tissue type and class into a single label
+pi$class <- yall
+
+pi <- pi %>%
+  mutate(tissue_class = paste(tissue, class, sep = "_"))
+
+# Determine how many pixels per group (minimum count)
+pixels_per_group <- pi %>%
+  group_by(tissue_class) %>%
+  tally() %>%
+  pull(n) %>%
+  min()  ## or choose fixed like: pixels_per_group <- 100
+
+set.seed(123)  # Reproducibility
+
+# Sample equal number of pixels per tissue_class combination
+equal_pixel_idx <- pi %>%
+  mutate(row_id = row_number()) %>%
+  group_by(tissue_class) %>%
+  slice_sample(n = pixels_per_group) %>%
+  ungroup() %>%
+  pull(row_id)
+
+# Subset the data
+xall <- xall[equal_pixel_idx, ]
+yall <- yall[equal_pixel_idx]
+pi <- pi[equal_pixel_idx, ]
+pi$class <- yall
+```
+
+```{r Split Data into Training and Testing Sets}
+## Identify unique sample IDs
+unique_samples <- unique(pi$name)
+
+## Split patients or samples, not pixels
+set.seed(123)
+train_samples <- sample(unique_samples, size = floor(0.7 * length(unique_samples)))
+
+## Train/test split
+train_idx <- which(pi$name %in% train_samples)
+test_idx  <- which(!pi$name %in% train_samples)
+
+sample_names <- pi$name
+
+xtrain <- xall[train_idx, ]
+ytrain <- yall[train_idx]
+xtest  <- xall[test_idx, ]
+ytest  <- yall[test_idx]
+```
+
+
+
+
+
+
+
+
+
+
+
+
+<br>
+
+#### **Preprocessing and Statistical Model Settings**
+
+```{r chunk3, fig.align = "center"}
+if (peak_alignment_method == "clustering") {
+  cluster_bin_size <- c("Cluster Height:", clust_h)
+} else if (peak_alignment_method == "binning") {
+  cluster_bin_size <- c("Bin Size:", "0.01")
+} else if (peak_alignment_method == "featurelist") {
+  cluster_bin_size <- c("Peak Mass Error:", paste0(ppm_error, " ppm"))
+}
+
+if (is.null(background_file)) {
+  bg_exclusion <- "no"
+} else if (!is.na(background_file)) {
+  bg_exclusion <- "yes"
+}
+train_fraction <- 0.7
+settings_df <- rbind(#c("SNR Threshold:", SNR_thresh),
+                     c("Mass Range:", paste0('<i>m/z</i> ', mass_range[1], " - ", mass_range[2])),
+                     c("Peak Alignment Method:", peak_alignment_method),
+                     cluster_bin_size,
+                     c("Background Peak Exclusion:", bg_exclusion),
+                     c("Normalization Method:", normalization_method),
+                     c("Randomization Seed:", seed),
+                     c("Train/Test Split:", paste0((train_fraction*100),"/",(100-(train_fraction*100)))),
+                     c("Elastic Net Alpha:", "1 (LASSO)"))
+
+classes2 <- tools::toTitleCase(gsub("_", " ", classes))
+#classes2 <- unlist(lapply(str_split(classes, pattern  = " "), tail, n = 1L)) ## If class is last element of full class name
+#classes2 <- unlist(lapply(str_split(classes, pattern  = "_"), tail, n = 1L)) ## If class is last element of full class name
+
+kable(settings_df,
+      row.names = FALSE,
+      align = "l",
+      format = "html",
+      escape = FALSE)%>%
+  column_spec(1:2, width = "3in")%>% 
+  kable_styling(full_width = F)
+
+#cols <- rev(c(hue_pal()(2))) ## teal, salmon
+cols <- c(hue_pal()(2)) ## salmon, teal
+```
+
+<br>
+
+#### **Session Info**
+
+```{r}
+sessionInfo()
+```
