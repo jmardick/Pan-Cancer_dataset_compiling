@@ -1,6 +1,5 @@
 ---
 title: "DESI Compiling"
-subtitle: "Preliminary Hierarchical Clustering"
 author: "Jacob Mardick"
 date: "`r format(Sys.time(), '%B %d, %Y %H:%M')`"
 knit: (function(inputFile, encoding) { 
@@ -168,7 +167,7 @@ thyroid_pixelInfoList <- thyroid_env$pixelInfoList
 thyroid_pi <- thyroid_env$pi
 thyroid_pi$tissue <- "Thyroid" 
 
-## Combine Tissues -----------Don't forget to add breast to below lines------------------------------------
+## Combine Tissues
 dataList <- c(brain_dataList, breast_dataList, kidney_dataList, lung_dataList, ovarian_dataList, thyroid_dataList)
 pixelInfoList <- c(brain_pixelInfoList, breast_pixelInfoList, kidney_pixelInfoList, lung_pixelInfoList, ovarian_pixelInfoList, thyroid_pixelInfoList)
 pi <- bind_rows(brain_pi, breast_pi, kidney_pi, lung_pi, ovarian_pi, thyroid_pi)
