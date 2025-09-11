@@ -75,7 +75,7 @@ library(scales) ## for integer y-axis on histogram
 ## Mass range to filter
 mass_range <- c(100,1000)
 
-## Peak Alignment Method: "clustering" or "binning" (TBD on "featurelist")
+## Peak Alignment Method: "clustering"
 peak_alignment_method <- "clustering"
 
 ## If peak alignment method is "clustering":
