@@ -111,8 +111,8 @@ if(!file.exists(files_dir)) {
 ```
 
 ```{r load data}
-load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_Hierarchical-Clustering_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/04_aligned_spectra.RData")
-load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_Hierarchical-Clustering_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/compiled_data_input.RData")
+load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/04_aligned_spectra.RData")
+load("C:/Users/Jacob/Documents/Thesis/Aim 1/0001 Dataset Compiling/Pan-Cancer_dataset_compiling/outputs/DESI_Compiling_2025-05-22/2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files/compiled_data_input.RData")
 ```
 
 ```{r equalize pixels}
