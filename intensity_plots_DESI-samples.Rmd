@@ -1,0 +1,158 @@
+---
+title: "Cancer vs Normal Feature Plots"
+subtitle: "Features from '2025-05-28_12.52_DESI_Compiled_Lasso'"
+author: "<span style='font-size: 17px;'>`r Sys.info()[['user']]`</span><br><span style='font-size: 12px; color:#696969;'>Eberlin Lab, Department of Surgery<br>Baylor College of Medicine</span>"
+date: "<span style='font-size: 15px; color: black;'>`r format(Sys.time(), '%B %d, %Y %H:%M')`</span>"
+knit: (function(inputFile, encoding) { 
+      proj_name <- tools::file_path_sans_ext(basename(inputFile));
+      out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()));
+      if(!file.exists(out_dir)) {   dir.create(out_dir) };
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), 
+                        out_dir, 
+                        paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"),"_", proj_name, ".html"))) 
+                        })
+output: 
+  html_document:
+    keep_md: yes
+    toc: false
+geometry: margin=0.5in
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+max-width: 1600px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+```
+
+```{css, echo=FALSE}
+h1,h2, h3, h4, h5, p {
+text-align: center;
+font-size: 20px;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, cache = TRUE)
+## cache set to TRUE because sometimes otherwise the files directory disappears for some users
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(rmarkdown)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+
+library(tidyverse)
+library(readxl)
+library(scales)
+```
+
+```{r create directory for output files, include = FALSE}
+proj_name <- tools::file_path_sans_ext(basename(rstudioapi::getSourceEditorContext()$path))
+
+out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()))
+
+if(!file.exists(out_dir)) {   
+  dir.create(out_dir, recursive = TRUE) 
+  }
+
+files_dir <- file.path(out_dir, paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"), "_", proj_name, "_files"))
+
+if(!file.exists(files_dir)) {   
+  dir.create(files_dir, recursive = TRUE) 
+  }
+```
+
+```{r load data}
+## This script requires running DESI_Compiled_Lasso or MSPen_Compiled_Lasso scripts first
+## Load in xall, pi, yall from preprocessing
+load("C:/Users/Jacob/OneDrive - Baylor College of Medicine/Documents/Thesis/AIM1~1/0001DA~1/PAN-CA~1/outputs/DE9D74~1/2025-0~1.53_/04_ALI~1.RDA")
+load("C:/Users/Jacob/OneDrive - Baylor College of Medicine/Documents/Thesis/AIM1~1/0001DA~1/PAN-CA~1/outputs/DE9D74~1/2025-0~1.53_/COMPIL~1.RDA")
+
+## Extract features from Lasso (currently from 2025-05-28_12.52_DESI_Compiled_Lasso output)
+intensity_input <- gsub("\\\\", "/", r"(C:\Users\Jacob\OneDrive - Baylor College of Medicine\Documents\Thesis\Aim 1\0001 Dataset Compiling\Pan-Cancer_dataset_compiling\outputs\DESI_Compiled_Lasso_2025-05-28\2025-05-28_12.52_DESI_Compiled_Lasso_files - Copy\coefficients.csv)")
+intensity_input <- read.csv(intensity_input, row.names = 1, check.names = F)
+intensity_input <- intensity_input[rownames(intensity_input) != "Intercept", , drop = F]
+intensity_input <- as.numeric(rownames(intensity_input))
+```
+
+``` {r intensity data frame}
+intensity_xall <- xall[, intensity_input]
+intensity_df <- purrr::map_dfr(seq_len(ncol(intensity_xall)), function(i) {
+  tibble(
+    class = yall,
+    intensity = intensity_xall[, i],
+    intensity_label = paste0("m/z ", round(intensity_input[i], 3)),
+    pixel = rownames(xall)
+  )
+})
+
+## Ensure class is a factor
+intensity_df <- intensity_df |>
+  mutate(class = factor(class, levels = sort(unique(class))))
+
+## Split into one df per m/z
+intensity_list <- split(intensity_df, intensity_df$intensity_label)
+```
+
+``` {r plots}
+## Plot each ratio separately and save
+imap(intensity_list, function(df, nm) {
+  
+  ## Plot
+  p <- ggplot(df, aes(x = class, y = intensity)) +
+    ## Boxplot
+    geom_boxplot(width = 0.4, outlier.shape = NA, alpha = 0.2) +
+    # jitter all points
+    # geom_jitter(width = 0.15, size = 1.8, alpha = 0.7) +
+    ## Wilcoxon between the two levels (Cancer and Normal)
+    stat_compare_means(
+      method = "wilcox.test",
+      comparisons = list(levels(df$class)),
+      label = "p.format",
+      label.x = 1.5,
+      label.y = max(df$intensity, na.rm = TRUE) * 1.02,
+      size = 5
+    ) +
+    labs(
+      title = unique(df$intensity_label),
+      x     = "Class",
+      y     = "TIC Normalized Intensity"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.text.x   = element_text(size = 11),
+      plot.title.position = "plot",
+      plot.title    = element_text(hjust = 0.5, margin = margin(b = 10)),
+      legend.position = "right"
+    )
+
+  ## Save
+  safe_nm <- paste0("intensity_", gsub("[^0-9A-Za-z]+","_", unique(df$intensity_label)),".png")
+  ggsave(
+    filename = file.path(files_dir, safe_nm),
+    plot     = p,
+    width    = 8, height = 10,
+    dpi      = 300, bg = "white"
+  )
+
+  invisible(NULL)
+})
+```
+
+<br>
+
+#### **Session Info**
+
+```{r}
+sessionInfo()
+```
