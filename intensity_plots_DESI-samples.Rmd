@@ -50,6 +50,8 @@ library(rmarkdown)
 library(knitr)
 library(kableExtra)
 library(ggpubr)
+library(ggbeeswarm)
+library(ggrepel)
 
 library(tidyverse)
 library(readxl)
@@ -75,8 +77,8 @@ if(!file.exists(files_dir)) {
 ```{r load data}
 ## This script requires running DESI_Compiled_Lasso or MSPen_Compiled_Lasso scripts first
 ## Load in xall, pi, yall from preprocessing
-load("C:/Users/Jacob/OneDrive - Baylor College of Medicine/Documents/Thesis/AIM1~1/0001DA~1/PAN-CA~1/outputs/DE9D74~1/2025-0~1.53_/04_ALI~1.RDA")
-load("C:/Users/Jacob/OneDrive - Baylor College of Medicine/Documents/Thesis/AIM1~1/0001DA~1/PAN-CA~1/outputs/DE9D74~1/2025-0~1.53_/COMPIL~1.RDA")
+load(gsub("\\\\", "/", r"(C:\Users\Jacob\OneDrive - Baylor College of Medicine\Documents\Thesis\Aim 1\0001 Dataset Compiling\Pan-Cancer_dataset_compiling\outputs\DESI_Compiling_2025-05-22\2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files\04_aligned_spectra.RData)"))
+load(gsub("\\\\", "/", r"(C:\Users\Jacob\OneDrive - Baylor College of Medicine\Documents\Thesis\Aim 1\0001 Dataset Compiling\Pan-Cancer_dataset_compiling\outputs\DESI_Compiling_2025-05-22\2025-05-22_08.53_DESI_Compiling_Hierarchical-Clustering_files\compiled_data_input.RData)"))
 
 ## Extract features from Lasso (currently from 2025-05-28_12.52_DESI_Compiled_Lasso output)
 intensity_input <- gsub("\\\\", "/", r"(C:\Users\Jacob\OneDrive - Baylor College of Medicine\Documents\Thesis\Aim 1\0001 Dataset Compiling\Pan-Cancer_dataset_compiling\outputs\DESI_Compiled_Lasso_2025-05-28\2025-05-28_12.52_DESI_Compiled_Lasso_files - Copy\coefficients.csv)")
@@ -86,65 +88,238 @@ intensity_input <- as.numeric(rownames(intensity_input))
 ```
 
 ``` {r intensity data frame}
-intensity_xall <- xall[, intensity_input]
-intensity_df <- purrr::map_dfr(seq_len(ncol(intensity_xall)), function(i) {
+tol <- 1e-4
+intensity_input_idx <- sapply(intensity_input, function(mz) {
+  which.min(abs(as.numeric(colnames(xall)) - mz))
+})
+intensity_xall <- xall[, intensity_input_idx, drop = FALSE]
+## For Lasso selected features
+#intensity_df <- purrr::map_dfr(seq_len(ncol(intensity_xall)), function(i) {
+#  tibble(
+#    class = yall,
+#    intensity = intensity_xall[, i],
+#    log10_intensity = log10(intensity_xall[, i] + 1e-10),
+#    log_intensity = log(intensity_xall[, i] + 1e-10),
+#    intensity_label = paste0("m/z ", round(intensity_input[i], 3)),
+#    pixel = rownames(xall),
+#    sample_id = pi$name,
+#    tissue = pi$tissue
+#  )
+#})
+
+## For all detected features
+intensity_df <- purrr::map_dfr(seq_len(ncol(xall)), function(i) {
   tibble(
     class = yall,
-    intensity = intensity_xall[, i],
-    intensity_label = paste0("m/z ", round(intensity_input[i], 3)),
-    pixel = rownames(xall)
+    intensity = xall[, i],
+    log10_intensity = log10(xall[, i] + 1e-10),
+    log_intensity = log(xall[, i] + 1e-10),
+    intensity_label = paste0("m/z ", round(as.numeric(colnames(xall)[i]), 3)),
+    pixel = rownames(xall),
+    sample_id = pi$name,
+    tissue = pi$tissue
   )
 })
 
 ## Ensure class is a factor
 intensity_df <- intensity_df |>
-  mutate(class = factor(class, levels = sort(unique(class))))
+  mutate(class = factor(class, levels = sort(unique(class)))) |>
+  mutate(intensity = ifelse(is.na(intensity), 0, intensity),
+         log10_intensity = ifelse(is.na(log10_intensity), 0, log10_intensity),
+         log_intensity = ifelse(is.na(log_intensity), 0, log_intensity))
 
 ## Split into one df per m/z
 intensity_list <- split(intensity_df, intensity_df$intensity_label)
 ```
 
-``` {r plots}
-## Plot each ratio separately and save
-imap(intensity_list, function(df, nm) {
+``` {r compute stats per ion}
+stats_tbl <- purrr::map_dfr(intensity_list, function(df) {
   
-  ## Plot
-  p <- ggplot(df, aes(x = class, y = intensity)) +
-    ## Boxplot
-    geom_boxplot(width = 0.4, outlier.shape = NA, alpha = 0.2) +
-    # jitter all points
-    # geom_jitter(width = 0.15, size = 1.8, alpha = 0.7) +
-    ## Wilcoxon between the two levels (Cancer and Normal)
-    stat_compare_means(
-      method = "wilcox.test",
-      comparisons = list(levels(df$class)),
-      label = "p.format",
-      label.x = 1.5,
-      label.y = max(df$intensity, na.rm = TRUE) * 1.02,
-      size = 5
-    ) +
-    labs(
-      title = unique(df$intensity_label),
-      x     = "Class",
-      y     = "TIC Normalized Intensity"
-    ) +
-    theme_minimal(base_size = 14) +
-    theme(
-      axis.text.x   = element_text(size = 11),
-      plot.title.position = "plot",
-      plot.title    = element_text(hjust = 0.5, margin = margin(b = 10)),
-      legend.position = "right"
-    )
+  df_sample <- df |>
+    group_by(sample_id, class) |>
+    summarize(median_intensity = median(intensity), .groups = "drop")
+  
+  if (n_distinct(df_sample$class) < 2) {
+    return(tibble(
+      intensity_label = unique(df$intensity_label),
+      p = NA_real_,
+      auc = NA_real_,
+      n_cancer = sum(df_sample$class == "Cancer"),
+      n_normal = sum(df_sample$class == "Normal")
+    ))
+  }
+  
+  ## Perform Wilcoxon rank-sum test comparing medians of sample level normal and cancer class
+  wt <- wilcox.test(median_intensity ~ class, 
+                      data = df_sample, 
+                      exact = F, ## normal approximation by central limit theorem (for n > 50 or with ties)
+                      correct = T ## apply continuity correction
+                      )
+  
+  ## Compute AUC (probability a random cancer > random normal)
+  n_cancer <- sum(df_sample$class == "Cancer")
+  n_normal <- sum(df_sample$class == "Normal")
+  auc <- as.numeric(wt$statistic) / (n_cancer * n_normal)
+  
+  tibble(
+    intensity_label = unique(df$intensity_label),
+    p = wt$p.value,
+    auc = auc,
+    n_cancer = n_cancer,
+    n_normal = n_normal
+  )
+})
 
-  ## Save
-  safe_nm <- paste0("intensity_", gsub("[^0-9A-Za-z]+","_", unique(df$intensity_label)),".png")
-  ggsave(
-    filename = file.path(files_dir, safe_nm),
-    plot     = p,
-    width    = 8, height = 10,
-    dpi      = 300, bg = "white"
+## Bonferroni-Hochberg Correction across all ions
+stats_tbl <- stats_tbl |>
+  mutate(q = p.adjust(p, method = "BH"))
+```
+
+``` {r volcano plot}
+volcano_df <- stats_tbl |>
+  mutate(
+    effect = auc - 0.5,
+    neglogq = -log10(q),
+    significant = ifelse(q < 0.05, "Yes", "No"),
+    ital_label = sub("m/z\\s+", "", intensity_label),
+    label_parsed = paste0("italic(m/z)~", ital_label)
   )
 
+top_features <- volcano_df |>
+  arrange(q) |>
+  slice_head(n = 1)
+
+p_volcano <- ggplot(volcano_df, aes(x = effect, y = neglogq)) +
+  geom_point(aes(color = significant), alpha = 0.7, size = 4) +
+  scale_color_manual(values = c("No" = "grey60", "Yes" = "red")) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  
+  ## --- Fix: label_parsed + parse = TRUE ---
+  geom_text_repel(
+    data = top_features,
+    aes(label = label_parsed),
+    parse = TRUE,
+    size = 16,
+    nudge_x = 0.185,
+    nudge_y = -5,
+    box.padding = 0.5,
+    segment.color = "black",
+    segment.size = 2,
+    segment.alpha = 0.8,
+    force = 1,
+    min.segment.length = 0
+  ) +
+  
+  labs(
+    title = "DESI Untargeted Ions",
+    x = "Effect size (AUC − 0.5)",
+    y = expression(-log[10]("BH q-value"))
+  ) +
+  
+  theme_minimal(base_size = 42) +
+  theme(
+    plot.title = element_text(hjust = 0.5, margin = margin(b = 10)),
+    legend.position = "none"
+  )
+
+ggsave(file.path(files_dir, "volcano_plot.png"),
+       p_volcano, width = 10, height = 13, dpi = 300, bg = "white")
+```
+
+``` {r ion boxplots}
+## Plot each ratio separately and save
+stats_lut <- stats_tbl |>
+  select(intensity_label, p, q, auc)
+
+## Select the top 5 ions from the volcano plot
+top5_ions <- volcano_df |>
+  arrange(q) |>
+  slice_head(n = 5) |>
+  pull(intensity_label)
+
+## Subset intensity_list
+top5_list <- intensity_list[names(intensity_list) %in% top5_ions]
+
+imap(top5_list, function(df, nm) {
+  st <- stats_lut |>
+    filter(intensity_label == unique(df$intensity_label)) |>
+    slice(1)
+  
+  p_txt  <- ifelse(is.na(st$p),  "NA", formatC(st$p,  format = "e", digits = 2))
+  q_txt  <- ifelse(is.na(st$q),  "NA", formatC(st$q,  format = "e", digits = 2))
+  auc_txt<- ifelse(is.na(st$auc),"NA", formatC(st$auc, format = "f", digits = 2))
+  
+  ## Build the annotation text
+  ann_text <- paste0("q = ", q_txt)
+  
+  ## Titles
+  raw_title <- unique(df$intensity_label)[1]
+  mz_val <- sub("m/z\\s+", "", raw_title)
+
+  p <- ggplot(df, aes(x = class, y = log_intensity)) +
+    geom_quasirandom(size = 0.2, alpha = 0.05, width = 0.3, aes(color = tissue)) +
+    scale_color_viridis_d(name = "Tissue Type") +
+    annotate("text",
+             x = 1.5,
+             y = min(df$log_intensity, na.rm = TRUE) * 1.1,
+             label = ann_text,
+             size = 24) +
+    labs(
+      title = bquote(italic(m/z)~.(mz_val)),
+      x     = "Class",
+      y     = expression(log("TIC Normalized Intensity + 1e-10"))
+    ) +
+    theme_minimal(base_size = 84) +
+    theme(
+      axis.text.x = element_text(size = 74, angle = 45, hjust = 1),
+      axis.title = element_text(size = 80),
+      plot.title.position = "plot",
+      plot.title = element_text(hjust = 0.5, margin = margin(b = 10), size = 100),
+      legend.position = "right",
+      legend.title = element_text(size = 80),
+      legend.text = element_text(size = 78),
+    ) +
+    guides(color = guide_legend(
+      override.aes = list(size = 14, alpha = 1)
+    ))
+  
+  safe_nm <- paste0("intensity_", gsub("[^0-9A-Za-z]+","_", unique(df$intensity_label)),".png")
+  ggsave(file.path(files_dir, safe_nm),
+         p, width = 20, height = 26, dpi = 300, bg = "white")
+  
+  invisible(NULL)
+})
+```
+
+``` {r top5 volcano ion plots}
+imap(top5_list, function(df, nm) {
+  raw_title <- unique(df$intensity_label)[1]
+  mz_val <- sub("m/z\\s+", "", raw_title)
+  
+  p <- ggplot(df, aes(x = class, y = log_intensity, color = tissue)) +
+    geom_quasirandom(size = 0.2, alpha = 0.1, width = 0.3) +
+    facet_wrap(~ tissue, scales = "free_x") +
+    scale_color_viridis_d(name = "Tissue Type") +
+    labs(
+      title = bquote(italic(m/z)~.(mz_val)~"Stratified By Tissue"),
+      x     = "Class (Normal vs Cancer)",
+      y     = expression(log("TIC Normalized Intensity + 1e-10"))
+    ) +
+    theme_minimal(base_size = 44) +
+    theme(
+      axis.text.x   = element_text(size = 37, angle = 45, hjust = 1),
+      axis.title.x = element_text(size = 40),
+      plot.title.position = "plot",
+      plot.title    = element_text(hjust = 0.5, margin = margin(b = 10)),
+      legend.position = "none",
+      strip.text = element_text(size = 46)
+    )
+  
+  safe_nm <- paste0("stratified_", gsub("[^0-9A-Za-z]+","_", unique(df$intensity_label)),".png")
+  ggsave(file.path(files_dir, safe_nm),
+         p, width = 30, height = 15, dpi = 300, bg = "white")
+  
   invisible(NULL)
 })
 ```
