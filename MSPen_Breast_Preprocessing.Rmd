@@ -1,0 +1,173 @@
+---
+title: "MSPen Breast Preprocessing"
+author: "<span style='font-size: 17px;'>`r Sys.info()[['user']]`</span><br><span style='font-size: 12px; color:#696969;'>Eberlin Lab, Department of Surgery<br>Baylor College of Medicine</span>"
+date: "`r format(Sys.time(), '%B %d, %Y %H:%M')`"
+knit: (function(inputFile, encoding) { 
+      proj_name <- tools::file_path_sans_ext(basename(inputFile));
+      out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()));
+      if(!file.exists(out_dir)) {   dir.create(out_dir) };
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), 
+                        out_dir, 
+                        paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"),"_", proj_name, ".html"))) 
+                        })
+
+output: 
+  html_document:
+    keep_md: yes
+    df_print: paged
+    toc: false
+geometry: margin=0.5in
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+max-width: 1600px;
+margin-left: auto;
+margin-right: auto;
+}
+</style>
+```
+
+```{css, echo=FALSE}
+h1,h2, h3, h4, h5, p {
+text-align: center;
+font-size: 20px;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = FALSE, cache = TRUE)
+## cache set to TRUE because sometimes otherwise the files directory disappears for some users
+```
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(rmarkdown)
+library(knitr)
+library(kableExtra)
+library(ggpubr)
+
+library(tidyverse)
+library(reshape2)
+library(readxl)
+library(rawrr)
+library(sqldf)
+
+library(stringr)
+library(doParallel)
+library(fcluster)
+library(johnfuncs)
+```
+
+```{r user input}
+## Full path to folder with sample files (excel or csv, or raw Thermo files)
+sample_dir <- gsub("\\\\", "/", r"(C:\Users\Jacob\Box\Eberlin_Lab_BCM\Projects\Panmodel Project\Breast)")
+
+## Full path to background peak list, otherwise NA
+background_file <- NA
+
+mass_range <- c(100, 1000)
+SNR_thresh <- 2
+```
+
+```{r create output directory, include = FALSE}
+proj_name <- tools::file_path_sans_ext(basename(rstudioapi::getSourceEditorContext()$path))
+
+out_dir <- file.path("outputs", paste0(proj_name, "_", Sys.Date()))
+
+if(!file.exists(out_dir)) {   
+  dir.create(out_dir, recursive = TRUE) 
+  }
+
+files_dir <- file.path(out_dir, paste0(format(Sys.time(), "%Y-%m-%d_%H.%M"), "_", proj_name, "_files"))
+
+if(!file.exists(files_dir)) {   
+  dir.create(files_dir, recursive = TRUE) 
+  }
+```
+
+## **Data Processing**
+
+### **Read in Files**
+
+```{r classes}
+## read sub-directories for class names
+classes <- gsub(file.path(sample_dir, "/"), "", list.dirs(sample_dir, recursive=FALSE), fixed=TRUE)
+```
+
+```{r file extension}
+sample_file_ext <- unique(unlist(
+  lapply(classes, function(x) 
+    tools::file_ext(list.files(file.path(sample_dir, "/",x,"/"))))))[1] 
+## only take the first file extension type...tbd if more than one type in folder
+```
+
+```{r file names}
+file_name_list <- lapply(classes, function(x) 
+  list.files(path = file.path(sample_dir,x), pattern = paste0("*.", sample_file_ext), full.names = TRUE))
+
+## Ensure patient ordering is consistent across different OSes.
+file_name_list <- lapply(file_name_list, sort)
+```
+
+```{r sample names}
+sample_names_list <- lapply(file_name_list, function(x) tools::file_path_sans_ext(basename(x)))
+names(sample_names_list) <- classes
+
+sample_names <- unlist(sample_names_list)
+
+sample_names_df <- purrr::map_df(sample_names_list, ~as.data.frame(.x), .id="id")
+colnames(sample_names_df) <- c("class", "sample_name")
+```
+
+```{r csv data}
+if (sample_file_ext == "csv") {
+  fixed_objects <- list(mass_range = mass_range, SNR_thresh = SNR_thresh)
+  
+  spectra_list <- nested_process_csv(file_name_list, fixed_objects)
+  
+  ## Set sample names and classes of spectra_list
+  spectra_list <- lapply(seq_along(spectra_list), \(i) setNames(spectra_list[[i]], sample_names_list[[i]]))
+  names(spectra_list) <- classes
+}
+```
+
+```{r excel data}
+if (sample_file_ext == "xlsx") {
+  fixed_objects <- list(mass_range = mass_range, SNR_thresh = SNR_thresh)
+  
+  spectra_list <- nested_process_xlsx(file_name_list, fixed_objects)
+  
+  ## Set sample names and classes of spectra_list
+  spectra_list <- lapply(seq_along(spectra_list), \(i) setNames(spectra_list[[i]], sample_names_list[[i]]))
+  names(spectra_list) <- classes
+}
+```
+
+```{r raw Thermo data}
+## If sample files are raw Thermo
+if (sample_file_ext == "raw") {
+  fixed_objects <- list(scans = scans, mass_range = mass_range, SNR_thresh = SNR_thresh)
+  
+  spectra_list <- nested_process_raw_thermo(file_name_list, fixed_objects)
+  
+  ## Set sample names and classes of spectra_list
+  spectra_list <- lapply(seq_along(spectra_list), \(i) setNames(spectra_list[[i]], sample_names_list[[i]]))
+  names(spectra_list) <- classes
+}
+```
+
+``` {r save mspen brain}
+save(spectra_list, file_name_list, file = file.path(files_dir, "01_dataList.RData"))
+```
+
+#### **Session Info**
+
+```{r}
+sessionInfo()
+```
